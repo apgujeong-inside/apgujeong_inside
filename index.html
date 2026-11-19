@@ -1,5 +1,1231 @@
 <!DOCTYPE html>
 <html lang="ko" style="--cmp-lift: 0px;"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        // storage.get and .list calls not yet answered, read by the parent at this frame's 'load' (an answer may restyle the page); counted
+        // here, not there, because WebKit can run this frame's 'load' in the parent before a message posted while parsing has arrived.
+        let storageReadsOut = 0;
+        try { Object.defineProperty(window, '__storageReadsOut', { configurable: true, get: () => storageReadsOut }); } catch (e) {}
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+              storageReadsOut += 1;
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+              storageReadsOut += 1;
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              // Draws only the top, 630/1200 of the width tall, as the link preview is 1200x630. `height` also shortens html-to-image's copy of the root and
+              // what its % min- and max-height resolve against, which moves centred content; `style` undoes that. Keep in step with app/page.tsx.
+              const previewHeight = Math.ceil((rootElement.offsetWidth * 630) / 1200);
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                ...(rootElement.offsetHeight > previewHeight && {
+                  height: previewHeight,
+                  style: { height: window.getComputedStyle(rootElement).height, minHeight: '0', maxHeight: 'none' },
+                }),
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        // Same as focusFragmentTarget in app/page.tsx; change both together.
+        const focusFragmentTarget = (target, focusVisible) => {
+          if (!document.hasFocus() || target === document.body) return;
+          target.focus({ preventScroll: true, focusVisible });
+          if (document.activeElement === target || target.hasAttribute("tabindex")) return;
+          const takeBack = () => {
+            if (document.activeElement === target) return;
+            target.removeAttribute("tabindex");
+            target.removeEventListener("blur", takeBack);
+          };
+          target.setAttribute("tabindex", "-1");
+          target.addEventListener("blur", takeBack);
+          target.focus({ preventScroll: true, focusVisible });
+          takeBack();
+        };
+
+        const scrollToFragment = (fragment, linkEl) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+            focusFragmentTarget(target, linkEl.matches(":focus-visible"));
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        const onLinkClick = (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a, area[href]");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "" || scrollToFragment(fragment, linkEl)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+        };
+        window.addEventListener('click', onLinkClick);
+
+        // HACK: a click on an <a download> that is not in the document, or a dispatched click that does not bubble, never reaches the window
+        // listener, so the link gets a listener of its own while its click() or dispatchEvent() runs, after the artifact's. Change with app/page.tsx.
+        const RealAnchor = window.HTMLAnchorElement;
+        const RealMouseEvent = window.MouseEvent;
+        const anchorProto = RealAnchor?.prototype;
+        const superProto = anchorProto && Object.getPrototypeOf(anchorProto);
+        if (typeof RealAnchor === 'function' && typeof RealMouseEvent === 'function' && typeof superProto?.click === 'function' && typeof superProto?.dispatchEvent === 'function') {
+          const onMissedClick = (event) => {
+            if (!event.defaultPrevented) onLinkClick(event);
+          };
+          // Links whose click() or dispatchEvent() is running, so a call made during it leaves the outer call's listener in place.
+          const listening = new WeakSet();
+          const callHearingMissed = (anchor, bubbles, call) => {
+            if (!(anchor instanceof RealAnchor) || !anchor.hasAttribute('download') || (anchor.isConnected && bubbles) || listening.has(anchor)) {
+              return call();
+            }
+            listening.add(anchor);
+            anchor.addEventListener('click', onMissedClick);
+            try {
+              return call();
+            } finally {
+              listening.delete(anchor);
+              anchor.removeEventListener('click', onMissedClick);
+            }
+          };
+          anchorProto.click = function () {
+            return callHearingMissed(this, true, () => superProto.click.call(this));
+          };
+          anchorProto.dispatchEvent = function (event) {
+            const call = () => superProto.dispatchEvent.call(this, event);
+            return event instanceof RealMouseEvent && event.type === 'click' ? callHearingMissed(this, event.bubbles, call) : call();
+          };
+        }
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+        // Only for a page that still shows nothing a second later: one that draws usually works on after a refused sound or a failed side call.
+        // A frame hidden behind the code view has no height, so a full-window canvas there would read as empty.
+        window.addEventListener('unhandledrejection', (event) => setTimeout(() => {
+          if (event.defaultPrevented || document.readyState === 'loading' || !window.innerHeight) return;
+          for (const el of document.querySelectorAll('body *')) {
+            if (el.getBoundingClientRect().height > 0) return;
+          }
+          if (document.body?.innerText.trim()) return;
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + (event.reason?.message || event.reason) }, '*');
+        }, 1000));
+
+        try {
+          (() => {
+            const m=1e3,b=Reflect.apply;function lacksWebgl(e,l=Object.getOwnPropertyDescriptor(e.HTMLCanvasElement.prototype,"getContext")?.value){if(typeof e.WebGLRenderingContext!="function")return!0;if(typeof l!="function")return!1;const u=e.document.createElement("canvas"),o=b(l,u,["webgl"])??b(l,u,["experimental-webgl"]);return o instanceof e.WebGLRenderingContext&&o.getExtension("WEBGL_lose_context")?.loseContext(),o===null}function watchWebgl(e,l){const u=e.setTimeout.bind(e),o=e.HTMLCanvasElement.prototype,i=Object.getOwnPropertyDescriptor(o,"getContext"),f=i?.value;if(!i||typeof f!="function")return()=>{};let s=!1,d=!1,p=!1,c=null;const g=new WeakSet,h=new WeakSet,C=t=>{const{width:n,height:r}=t.getBoundingClientRect();return t.isConnected&&t.ownerDocument===e.document&&n>0&&r>0},a=()=>{d||(d=p)},L=(t,n,r)=>{if(n!=="webgl"&&n!=="webgl2"&&n!=="experimental-webgl"){r&&h.add(t);return}if(r){c=!0;return}s||g.has(t)||(c??(c=!lacksWebgl(e,f)),!c&&(g.add(t),e.addEventListener("error",a),e.addEventListener("unhandledrejection",a),p=!0,u(()=>{p=!1},0),u(()=>{!s&&!h.has(t)&&(d||C(t))&&(s=!0,l())},1e3)))};return Object.defineProperty(o,"getContext",{...i,value:function(...n){const r=b(f,this,n);try{L(this,n[0],r!==null)}catch{}return r}}),()=>{s=!0,e.removeEventListener("error",a),e.removeEventListener("unhandledrejection",a),Object.defineProperty(o,"getContext",i)}}
+            watchWebgl(window, () => realParent.postMessage({ type: 'webglUnavailable' }, '*'));
+          })();
+        } catch (e) {}
+
+        // Last, so that if this throws, everything above is already set up. In its own function, so that its names stay local.
+        (() => {
+          function forwardConsole(o,t){const e=String,i=n=>{try{return e(n??"")}catch{return"[object Object]"}},c=[["log",""],["error","Error: "],["warn","Warning: "]];for(const[n,s]of c){const f=o[n];o[n]=(...r)=>{f.apply(o,r),t(s+r.map(i).join(" "))}}}
+          forwardConsole(window.console, (line) => realParent.postMessage({ type: 'console', message: line }, '*'));
+        })();
+      })();
+    </script>
+  <script>
+(function () {
+  "use strict";
+  if (window.__coworkHtmlReviewGuest) return;
+  window.__coworkHtmlReviewGuest = true;
+
+  var READY_TYPE = "__cowork_html_review_ready__";
+  var SEL_CLASS = "__cwhr-sel";
+  var CONTEXT_LEN = 32;
+  var EXACT_CAP = 1000;
+  var port = null;
+  var mode = false;
+  var pins = [];
+  var quotes = [];
+  // Resolved Range per quote id; invalidated on DOM mutation and on a
+  // fresh quotes set. Scroll/resize re-reports just re-read
+  // getClientRects() from the cached Range. Null prototype - ids are
+  // collaborator-writable and must not collide with Object.prototype.
+  var quoteRanges = Object.create(null);
+  var hoverEl = null;
+  var selected = null;
+  var hasTextSel = false;
+  var rafPending = false;
+  // Capture before page body scripts can shadow them; start() defers
+  // to DOMContentLoaded which page code can race.
+  var _MessageChannel = window.MessageChannel;
+  var _topPost = window.top.postMessage.bind(window.top);
+
+  function visibleText(el) {
+    // innerText drops display:none/visibility:hidden subtrees; keep an
+    // empty innerText (icon-only el) rather than falling through to
+    // textContent which would re-include hidden text.
+    var t = typeof el.innerText === "string" ? el.innerText : (el.textContent || "");
+    return t.replace(/\s+/g, " ").trim();
+  }
+
+  // Comment-mode cursor: see HTML_PREVIEW_COMMENT_CURSOR above.
+  var BUBBLE_CURSOR = "url(\"data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20width%3D'24'%20height%3D'24'%20viewBox%3D'0%200%2024%2024'%3E%3Cpath%20d%3D'M12%20.5h0A11.5%2011.5%200%200%201%2023.5%2012v0A11.5%2011.5%200%200%201%2012%2023.5H2.5a2%202%200%200%201-2-2V12A11.5%2011.5%200%200%201%2012%20.5Z'%20fill%3D'%23fff'%20stroke%3D'rgba(0%2C0%2C0%2C0.22)'%20stroke-width%3D'1'%2F%3E%3C%2Fsvg%3E\") 1 23, url(\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC\") 1 23, default";
+
+  function injectStyle() {
+    var style = document.createElement("style");
+    // Hover box is painted by the host (from streamed rects); the guest
+    // marks the selected element and, in comment mode, swaps the native
+    // cursor for the comment bubble (forced, so page cursor styles don't
+    // fight the picker). While a composer or thread card is open the arrow
+    // returns, so the bubble cursor and the pin just placed never show at
+    // once. Keyed on <html> data attributes, which page scripts that
+    // rewrite body.className leave alone; ":not(#_)" lifts the rules to
+    // id-level specificity so a page's own !important cursor rules lose.
+    var ANY = ":not(#__cwhr_)";
+    var MODE = "html[data-cwhr-mode]";
+    var COMPOSING = MODE + "[data-cwhr-composing]";
+    style.textContent =
+      "." + SEL_CLASS + "{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}" +
+      MODE + ANY + "," + MODE + " " + ANY + "{cursor:" + BUBBLE_CURSOR + " !important;}" +
+      COMPOSING + ANY + "," + COMPOSING + " " + ANY + "{cursor:default !important;}";
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function isUnique(sel) {
+    try {
+      return document.querySelectorAll(sel).length === 1;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Mirrors the host's stripInvisibles ranges. The host strips these
+  // from stored selectors, so a selector built on a value containing
+  // them would validate here but never match again - skip those rungs
+  // and fall through to the structural ladder instead.
+  function hasInvisibles(s) {
+    for (var i = 0; i < s.length; i++) {
+      var c = s.codePointAt(i);
+      if (c > 0xffff) i++;
+      if (
+        c <= 0x1f ||
+        c === 0x061c ||
+        c === 0x070f ||
+        c === 0xad ||
+        (c >= 0x7f && c <= 0x9f) ||
+        c === 0x115f ||
+        c === 0x1160 ||
+        c === 0x180e ||
+        (c >= 0x200b && c <= 0x200f) ||
+        (c >= 0x202a && c <= 0x202e) ||
+        (c >= 0x2060 && c <= 0x2064) ||
+        (c >= 0x2066 && c <= 0x2069) ||
+        c === 0x3164 ||
+        c === 0xfeff ||
+        (c >= 0xfff9 && c <= 0xfffb) ||
+        c === 0xffa0 ||
+        (c >= 0xe0000 && c <= 0xe007f)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function escapeAttr(v) {
+    return String(v).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
+  // Selector ladder: unique #id -> unique [data-*] -> structural
+  // tag:nth-of-type path rooted at the nearest unique-id ancestor.
+  function selectorFor(el) {
+    if (el.id && !hasInvisibles(el.id) && isUnique("#" + CSS.escape(el.id))) {
+      return "#" + CSS.escape(el.id);
+    }
+    for (var i = 0; i < el.attributes.length; i++) {
+      var attr = el.attributes[i];
+      if (
+        attr.name.indexOf("data-") === 0 &&
+        attr.value &&
+        !hasInvisibles(attr.value)
+      ) {
+        var dataSel = "[" + attr.name + '="' + escapeAttr(attr.value) + '"]';
+        if (isUnique(dataSel)) return dataSel;
+      }
+    }
+    var parts = [];
+    var cur = el;
+    while (cur && cur !== document.body && cur.nodeType === 1 && parts.length < 10) {
+      var sel = cur.tagName.toLowerCase();
+      var parent = cur.parentElement;
+      if (parent) {
+        var sameTag = [];
+        for (var c = 0; c < parent.children.length; c++) {
+          if (parent.children[c].tagName === cur.tagName) sameTag.push(parent.children[c]);
+        }
+        if (sameTag.length > 1) {
+          sel += ":nth-of-type(" + (sameTag.indexOf(cur) + 1) + ")";
+        }
+      }
+      parts.unshift(sel);
+      if (
+        parent &&
+        parent.id &&
+        !hasInvisibles(parent.id) &&
+        isUnique("#" + CSS.escape(parent.id))
+      ) {
+        parts.unshift("#" + CSS.escape(parent.id));
+        return parts.join(" > ");
+      }
+      cur = parent;
+    }
+    if (cur === document.body) {
+      parts.unshift("body");
+      return parts.join(" > ");
+    }
+    // Depth cap hit without a root - an unrooted chain would match the
+    // first structural pattern anywhere in the document. Mark the pin
+    // detached instead of attaching it to the wrong element.
+    return ":not(*)";
+  }
+
+  function descriptorFor(el) {
+    var tag = "<" + el.tagName.toLowerCase() + ">";
+    var idPart = el.id ? " #" + el.id : "";
+    var text = visibleText(el).slice(0, 60);
+    var textPart = text ? ' "' + text + '"' : "";
+    // Nearest id'd ancestor, skipping the UCR-injected
+    // #artifacts-component-root-* wrapper which is implementation noise.
+    var section = el.parentElement;
+    while (
+      section &&
+      (!section.id || section.id.indexOf("artifacts-component-root") === 0)
+    ) {
+      section = section.parentElement;
+    }
+    var sectionPart = section && section.id ? " in #" + section.id : "";
+    return (tag + idPart + textPart + sectionPart).slice(0, 400);
+  }
+
+  // textContent offset of (node, offset) within body - the coordinate
+  // system text-quote anchors are stored in. -1 when the boundary
+  // isn't under body (shadow root, detached).
+  function textOffset(node, offset) {
+    var body = document.body;
+    if (!body) return -1;
+    try {
+      var pre = document.createRange();
+      pre.selectNodeContents(body);
+      pre.setEnd(node, offset);
+      return pre.toString().length;
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  // Inverse: build a Range covering [start, end) in body.textContent.
+  function rangeForOffsets(start, end) {
+    var body = document.body;
+    if (!body) return null;
+    var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    var acc = 0;
+    var range = document.createRange();
+    var haveStart = false;
+    var t;
+    while ((t = walker.nextNode())) {
+      var next = acc + t.length;
+      if (!haveStart && start < next) {
+        range.setStart(t, start - acc);
+        haveStart = true;
+      }
+      if (haveStart && end <= next) {
+        range.setEnd(t, end - acc);
+        return range;
+      }
+      acc = next;
+    }
+    return null;
+  }
+
+  // Context-scored search (W3C text-quote resolution): slice-check the
+  // hint, else pick the occurrence whose surrounding chars best match
+  // prefix/suffix. MIRRORS locateTextQuote() above line-for-line - the
+  // tested export is the contract; this copy is what the sandbox runs.
+  function locateQuote(text, q) {
+    var ex = q.exact;
+    if (!ex) return null;
+    var hint = q.startOffset >= 0 ? q.startOffset : 0;
+    if (text.slice(hint, hint + ex.length) === ex) {
+      return { start: hint, end: hint + ex.length };
+    }
+    var best = -1;
+    var bestScore = -1;
+    var bestDist = Infinity;
+    var scanned = 0;
+    for (var idx = text.indexOf(ex); idx !== -1 && ++scanned <= 1000; idx = text.indexOf(ex, idx + 1)) {
+      var before = text.slice(Math.max(0, idx - CONTEXT_LEN), idx);
+      var after = text.slice(idx + ex.length, idx + ex.length + CONTEXT_LEN);
+      var sc = 0;
+      for (var i = 1; i <= q.prefix.length && i <= before.length; i++) {
+        if (q.prefix[q.prefix.length - i] !== before[before.length - i]) break;
+        sc++;
+      }
+      for (var j = 0; j < q.suffix.length && j < after.length; j++) {
+        if (q.suffix[j] !== after[j]) break;
+        sc++;
+      }
+      var dist = Math.abs(idx - hint);
+      if (sc > bestScore || (sc === bestScore && dist < bestDist)) {
+        best = idx;
+        bestScore = sc;
+        bestDist = dist;
+      }
+    }
+    return best === -1 ? null : { start: best, end: best + ex.length };
+  }
+
+  function collectLineRects(range, cap) {
+    var out = [];
+    var rects = range.getClientRects();
+    for (var i = 0; i < rects.length && out.length < cap; i++) {
+      var r = rects[i];
+      if (r.width > 0 && r.height > 0) {
+        out.push({ x: r.left, y: r.top, w: r.width, h: r.height });
+      }
+    }
+    return out;
+  }
+
+  function reportTextSel(full) {
+    if (!port) return;
+    var sel = window.getSelection();
+    var r = sel && !sel.isCollapsed && sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+    if (!r || !document.body || !document.body.contains(r.commonAncestorContainer)) {
+      if (hasTextSel) {
+        hasTextSel = false;
+        port.postMessage({ type: "textClear" });
+      }
+      return;
+    }
+    hasTextSel = true;
+    var br = r.getBoundingClientRect();
+    var msg = {
+      type: "textCapture",
+      rect: { x: br.left, y: br.top, w: br.width, h: br.height },
+      lineRects: collectLineRects(r, 80),
+    };
+    if (full) {
+      var live = document.body.textContent || "";
+      var so = textOffset(r.startContainer, r.startOffset);
+      var eo = textOffset(r.endContainer, r.endOffset);
+      if (so < 0 || eo < 0 || eo <= so) {
+        // Unanchorable selection (shadow root, foreign node). A
+        // rect-only post here would make the host pair the new rect
+        // with a stale prior anchor - clear instead.
+        hasTextSel = false;
+        port.postMessage({ type: "textClear" });
+        return;
+      }
+      // Denomination invariant: exact/prefix/suffix are byte-identical
+      // slices of body.textContent. Truncation adjusts endOffset so
+      // the host's (endOffset - startOffset === exact.length) shape
+      // check holds. Cut points back off surrogate halves - a lone
+      // surrogate would never relocate and fails UTF-8 persist.
+      var capped = Math.min(eo, so + EXACT_CAP);
+      if (capped < eo) {
+        var hc = live.charCodeAt(capped - 1);
+        if (hc >= 0xd800 && hc <= 0xdbff) capped--;
+      }
+      if (capped <= so) {
+        port.postMessage(msg);
+        return;
+      }
+      var pStart = Math.max(0, so - CONTEXT_LEN);
+      var pc = live.charCodeAt(pStart);
+      if (pc >= 0xdc00 && pc <= 0xdfff) pStart++;
+      var sEnd = Math.min(live.length, capped + CONTEXT_LEN);
+      if (sEnd < live.length) {
+        var sc = live.charCodeAt(sEnd - 1);
+        if (sc >= 0xd800 && sc <= 0xdbff) sEnd--;
+      }
+      msg.exact = live.slice(so, capped);
+      msg.prefix = live.slice(pStart, so);
+      msg.suffix = live.slice(capped, sEnd);
+      msg.startOffset = so;
+      msg.endOffset = capped;
+    }
+    port.postMessage(msg);
+  }
+
+  function clearSelection() {
+    if (selected) {
+      selected.classList.remove(SEL_CLASS);
+      selected = null;
+    }
+  }
+
+  // rAF-throttled cursor + hover-rect stream so the host can paint the
+  // inspector hover box (and knows the pointer is present) in comment mode.
+  var cursorPending = false;
+  var cursorX = -1;
+  var cursorY = -1;
+  function flushCursor() {
+    cursorPending = false;
+    if (!port) return;
+    var hover = null;
+    if (
+      hoverEl &&
+      hoverEl.nodeType === 1 &&
+      hoverEl !== document.body &&
+      hoverEl !== document.documentElement
+    ) {
+      var r = hoverEl.getBoundingClientRect();
+      if (r.width > 0 || r.height > 0) {
+        hover = { x: r.left, y: r.top, w: r.width, h: r.height };
+      }
+    }
+    port.postMessage({ type: "cursor", x: cursorX, y: cursorY, hover: hover });
+  }
+  function scheduleCursor() {
+    if (!cursorPending) {
+      cursorPending = true;
+      requestAnimationFrame(flushCursor);
+    }
+  }
+  function onMouseMove(ev) {
+    if (!mode || !port) return;
+    // Over the scrollbar gutter (clientX/Y past the content box) - hide
+    // the hover box like a leave.
+    var de = document.documentElement;
+    if (ev.clientX >= de.clientWidth || ev.clientY >= de.clientHeight) {
+      cursorX = -1;
+      cursorY = -1;
+      hoverEl = null;
+      scheduleCursor();
+      return;
+    }
+    cursorX = ev.clientX;
+    cursorY = ev.clientY;
+    hoverEl = ev.target;
+    scheduleCursor();
+  }
+  function onMouseLeave() {
+    if (!mode || !port) return;
+    cursorX = -1;
+    cursorY = -1;
+    hoverEl = null;
+    scheduleCursor();
+  }
+
+  function onClick(ev) {
+    if (!port) return;
+    if (!mode) {
+      // Mode off: don't intercept the page, just let the host close any
+      // open popover (thread card click-away). A non-collapsed selection
+      // means the click ended a drag-select - not a click-away.
+      var s = window.getSelection();
+      if (!s || s.isCollapsed) port.postMessage({ type: "clickAway" });
+      return;
+    }
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    var el = ev.target;
+    if (!el || el.nodeType !== 1 || el === document.documentElement) return;
+    if (el === document.body && el.firstElementChild) {
+      // Pin on body is rarely intentional; keep it anyway but as body.
+    }
+    clearSelection();
+    selected = el;
+    el.classList.add(SEL_CLASS);
+    var rect = el.getBoundingClientRect();
+    var pinX = rect.width > 0 ? (ev.clientX - rect.left) / rect.width : 0.5;
+    var pinY = rect.height > 0 ? (ev.clientY - rect.top) / rect.height : 0.5;
+    port.postMessage({
+      type: "capture",
+      selector: selectorFor(el).slice(0, 1000),
+      textHint: visibleText(el).slice(0, 300),
+      descriptor: descriptorFor(el),
+      pinX: Math.min(1, Math.max(0, pinX)),
+      pinY: Math.min(1, Math.max(0, pinY)),
+      clientX: ev.clientX,
+      clientY: ev.clientY,
+      rectLeft: rect.left,
+      rectTop: rect.top,
+    });
+  }
+
+  function reportRects() {
+    rafPending = false;
+    if (!port) return;
+    // Selected element's live bounds - keeps the host's draft pin /
+    // inspector tag / composer glued through scroll and reflow.
+    if (selected) {
+      var sr = selected.getBoundingClientRect();
+      port.postMessage({
+        type: "selRect",
+        left: sr.left,
+        top: sr.top,
+        w: sr.width,
+        h: sr.height,
+        found:
+          (sr.width > 0 || sr.height > 0) &&
+          document.documentElement.contains(selected),
+      });
+    }
+    var rects = [];
+    for (var i = 0; i < pins.length; i++) {
+      var p = pins[i];
+      var el = null;
+      try {
+        el = document.querySelector(p.selector);
+      } catch (e) {
+        el = null;
+      }
+      if (!el) {
+        rects.push({ id: p.id, x: 0, y: 0, found: false });
+        continue;
+      }
+      var r = el.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) {
+        rects.push({ id: p.id, x: 0, y: 0, found: false });
+        continue;
+      }
+      rects.push({
+        id: p.id,
+        x: r.left + p.pinX * r.width,
+        y: r.top + p.pinY * r.height,
+        found: true,
+      });
+    }
+    var quoteRects = [];
+    if (quotes.length > 0) {
+      var live = null;
+      for (var qi = 0; qi < quotes.length; qi++) {
+        var q = quotes[qi];
+        var qr = quoteRanges[q.id];
+        if (qr === undefined) {
+          if (live === null) {
+            live = (document.body && document.body.textContent) || "";
+          }
+          var loc = locateQuote(live, q);
+          qr = (loc && rangeForOffsets(loc.start, loc.end)) || null;
+          quoteRanges[q.id] = qr;
+        }
+        // Zero paintable rects (display:none subtree) reports as
+        // not-found so the host docks it as detached instead of
+        // rendering nothing clickable.
+        var qlr = qr ? collectLineRects(qr, 80) : [];
+        quoteRects.push(
+          qlr.length > 0
+            ? { id: q.id, found: true, lineRects: qlr }
+            : { id: q.id, found: false, lineRects: [] }
+        );
+      }
+    }
+    sentScrollY = window.scrollY || 0;
+    port.postMessage({
+      type: "rects",
+      rects: rects,
+      quoteRects: quoteRects,
+      scrollY: sentScrollY,
+    });
+  }
+
+  function scheduleRects() {
+    if (rafPending) return;
+    rafPending = true;
+    var done = false;
+    function run() {
+      if (done) return;
+      done = true;
+      reportRects();
+    }
+    // rAF for paint alignment, with a timeout fallback - rAF is
+    // suspended entirely in hidden tabs and pins must still settle
+    // when the tab becomes visible after background loading.
+    requestAnimationFrame(run);
+    setTimeout(run, 150);
+  }
+
+  var sentScrollY = 0;
+  // With nothing anchored, a report carries only the scroll position.
+  function scheduleAnchoredRects() {
+    if (selected || pins.length > 0 || quotes.length > 0) scheduleRects();
+  }
+
+  function setMode(on) {
+    mode = !!on;
+    document.documentElement.toggleAttribute("data-cwhr-mode", mode);
+    if (!mode) {
+      hoverEl = null;
+      clearSelection();
+    }
+  }
+
+  function setComposing(open) {
+    document.documentElement.toggleAttribute("data-cwhr-composing", !!open);
+  }
+
+  function onPortMessage(ev) {
+    var data = ev.data;
+    if (!data) return;
+    if (data.type === "mode") setMode(data.on);
+    else if (data.type === "composing") setComposing(data.open);
+    else if (data.type === "pins") {
+      pins = Array.isArray(data.pins) ? data.pins : [];
+      scheduleRects();
+    } else if (data.type === "quotes") {
+      quotes = Array.isArray(data.quotes) ? data.quotes : [];
+      quoteRanges = Object.create(null);
+      scheduleRects();
+    } else if (data.type === "clearSelection") {
+      clearSelection();
+    } else if (data.type === "clearTextSel") {
+      var ts = window.getSelection();
+      if (ts) ts.removeAllRanges();
+      hasTextSel = false;
+    } else if (data.type === "restoreScroll") {
+      var ry = Number(data.y);
+      if (isFinite(ry) && ry > 0) {
+        // Apply now and again at load - late images/fonts can grow the
+        // document after the first attempt clamps short.
+        window.scrollTo(0, ry);
+        window.addEventListener("load", function () {
+          window.scrollTo(0, ry);
+        });
+      }
+    }
+  }
+
+  function start() {
+    injectStyle();
+    var channel = new _MessageChannel();
+    port = channel.port1;
+    port.onmessage = onPortMessage;
+    // Sandboxed srcdoc origins can be opaque; "*" is required. The
+    // payload carries only the mount token (multiple sandboxes can be
+    // mounted at once - the token routes the port to the right overlay)
+    // and the channel port itself is pairwise-secure.
+    _topPost(
+      { type: READY_TYPE, token: "5a01c106-ad64-4642-b4ed-9819fad90599" },
+      "*",
+      [channel.port2]
+    );
+    document.addEventListener("mousemove", onMouseMove, true);
+    // documentElement (not document, capture) so this fires only when the
+    // pointer leaves the viewport - capture-phase on document would fire for
+    // every intra-document element-boundary crossing.
+    document.documentElement.addEventListener("mouseleave", onMouseLeave);
+    document.addEventListener("click", onClick, true);
+    // Text-selection capture: commit on mouseup/keyup (Shift+Arrow),
+    // clear on collapse. Not mode-gated; highlight-to-comment is
+    // always on.
+    function onSelCommit() { reportTextSel(true); }
+    document.addEventListener("mouseup", onSelCommit, true);
+    document.addEventListener("keyup", onSelCommit, true);
+    document.addEventListener("selectionchange", function () {
+      var s = window.getSelection();
+      if (hasTextSel && (!s || s.isCollapsed)) reportTextSel(false);
+    });
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape" && port) port.postMessage({ type: "dismiss" });
+    }, true);
+    // Scroll/resize move the hovered element under a stationary pointer -
+    // re-report its rect so the host's inspector box tracks it. Mutations
+    // stay rects-only (animating pages would chatter the cursor stream).
+    var textSelPending = false;
+    function scheduleTextSel() {
+      if (textSelPending) return;
+      textSelPending = true;
+      requestAnimationFrame(function () {
+        textSelPending = false;
+        reportTextSel(false);
+      });
+    }
+    function onLayoutChange() {
+      scheduleRects();
+      if (mode && hoverEl) scheduleCursor();
+      if (hasTextSel) scheduleTextSel();
+    }
+    window.addEventListener("scroll", onLayoutChange, true);
+    window.addEventListener("resize", onLayoutChange);
+    // Full-cache invalidate per childList mutation is acceptable: CSS
+    // animation doesn't fire the observer; JS writers at frame rate
+    // would re-relocate every frame but are rare. characterData isn't
+    // observed, so .data= edits leave highlights stale until the next
+    // childList mutation.
+    var observer = new MutationObserver(function () {
+      quoteRanges = Object.create(null);
+      scheduleAnchoredRects();
+      if (hasTextSel) scheduleTextSel();
+    });
+    function observe() {
+      if (document.body) observer.observe(document.body, { childList: true, subtree: true });
+    }
+    if (document.body) observe();
+    else document.addEventListener("DOMContentLoaded", observe);
+    // Settle pins after late layout (fonts, images).
+    setInterval(function () {
+      // A hidden page sends no scroll events.
+      if ((window.scrollY || 0) !== sentScrollY) scheduleRects();
+      else scheduleAnchoredRects();
+    }, 2000);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start);
+  } else {
+    start();
+  }
+})();
+</script>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>압구정 재건축 매물 브리핑</title>
@@ -2010,6 +3236,19 @@ body{padding-bottom:0}
 @media screen{#ratioNote{max-width:800px;text-align:left}}
 .jc-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.jc-grid div{background:#FAF9F4;border:1px solid var(--line);border-radius:10px;padding:10px 12px;font-size:12px;color:var(--ink-2)}.jc-grid b{display:block;font-size:18px;color:var(--ink);margin-top:2px}.jc-grid .em b{color:#C2552E}.jc-hl td{background:#FFFBF4;font-weight:700}.jc-faq details{border-bottom:1px solid var(--line);padding:9px 0}.jc-faq summary{cursor:pointer;font-weight:700;font-size:13.5px}.jc-faq p{font-size:12.5px;line-height:1.7;margin:8px 0 2px;color:var(--ink-2)}
 .jc-tbl td:nth-child(2),.jc-tbl td:nth-child(3){white-space:nowrap}.jc-tbl td:nth-child(1){min-width:170px}
+  /* 실거래가 매매 추이 그래프 */
+  .dvc-wrap{position:relative}
+  .dvc-svg{width:100%;height:auto;display:block;font-family:var(--sans);font-variant-numeric:tabular-nums}
+  .dvc-hit{cursor:pointer}
+  .dvc-tip{position:absolute;z-index:5;pointer-events:none;background:var(--deep);color:#fff;font-size:12px;line-height:1.55;border-radius:8px;padding:7px 11px;white-space:nowrap;box-shadow:var(--shadow-md);font-variant-numeric:tabular-nums}
+  .dvc-tip b{font-weight:800}
+  .dvc-dir{background:var(--sig-amber);color:#fff;border-radius:4px;padding:0 5px;font-size:10.5px;font-weight:700}
+  .dvc-empty{padding:34px 14px;text-align:center;color:var(--mute);font-size:12.5px;line-height:1.7}
+  .dvc-leg{display:flex;flex-wrap:wrap;gap:5px 16px;font-size:11.5px;color:var(--ink-2);margin:2px 0 8px}
+  .dvc-leg span{display:inline-flex;align-items:center;gap:5px}
+  .dvc-dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+  .dvc-ln{width:18px;height:3px;border-radius:2px;display:inline-block}
+  .dvc-ln.dash{background:repeating-linear-gradient(90deg,#1F5FA8 0 4px,transparent 4px 8px);height:2px}
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 <style id="apguBriefA4">
@@ -2288,8 +3527,8 @@ body.b-briefmode .b-printonly{display:block!important}
 </style>
 
 
-</head>
-<body style="" class="">
+<style>.__cwhr-sel{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}html[data-cwhr-mode]:not(#__cwhr_),html[data-cwhr-mode] :not(#__cwhr_){cursor:url("data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20width%3D'24'%20height%3D'24'%20viewBox%3D'0%200%2024%2024'%3E%3Cpath%20d%3D'M12%20.5h0A11.5%2011.5%200%200%201%2023.5%2012v0A11.5%2011.5%200%200%201%2012%2023.5H2.5a2%202%200%200%201-2-2V12A11.5%2011.5%200%200%201%2012%20.5Z'%20fill%3D'%23fff'%20stroke%3D'rgba(0%2C0%2C0%2C0.22)'%20stroke-width%3D'1'%2F%3E%3C%2Fsvg%3E") 1 23, url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC") 1 23, default !important;}html[data-cwhr-mode][data-cwhr-composing]:not(#__cwhr_),html[data-cwhr-mode][data-cwhr-composing] :not(#__cwhr_){cursor:default !important;}</style></head>
+<body style="" class="" id="artifacts-component-root-html">
 
 <div class="topbar">
   <div class="inner">
@@ -2323,7 +3562,7 @@ body.b-briefmode .b-printonly{display:block!important}
 
   <div id="loadView">
     <div class="bsec bload" id="bLoad">
-      <div class="ttl" style="margin-bottom:10px">엑셀 불러오기 <span class="cnt" id="bDataStamp">불러온 데이터: 2026.11.18 14:30 · 1.매물_시세_실거래가_통합.xlsx</span></div>
+      <div class="ttl" style="margin-bottom:10px">엑셀 불러오기 <span class="cnt" id="bDataStamp">불러온 데이터: 2026.11.19 11:41 · 1.매물_시세_실거래가_통합.xlsx</span></div>
       <div id="bDrop" class="bdrop">
         <div class="bdrop-icon">⬆</div>
         <div class="bdrop-main">엑셀 파일을 여기로 끌어놓거나 <span class="bdrop-btn">클릭해서 선택</span></div>
@@ -3231,12 +4470,12 @@ body.b-briefmode .b-printonly{display:block!important}
           <div class="msel" id="msZone"><button type="button" class="msel-btn" data-ms="Zone">2구역</button><div class="msel-menu" hidden=""><label class="msel-opt hd msel-all"><input type="checkbox" checked="" data-all="1"> 전체</label><label class="msel-opt"><input type="checkbox" value="1"> 1구역</label><label class="msel-opt"><input type="checkbox" value="2"> 2구역</label><label class="msel-opt"><input type="checkbox" value="3"> 3구역</label><label class="msel-opt"><input type="checkbox" value="4"> 4구역</label><label class="msel-opt"><input type="checkbox" value="5"> 5구역</label><label class="msel-opt"><input type="checkbox" value="6"> 6구역</label></div></div></div>
         <div class="dvf"><label>단지 <span class="msN" id="msN_Complex"></span></label>
           <div class="msel" id="msComplex"><button type="button" class="msel-btn" data-ms="Complex">전체 단지</button><div class="msel-menu" hidden=""><label class="msel-opt hd msel-all"><input type="checkbox" checked="" data-all="1"> 전체</label><label class="msel-opt"><input type="checkbox" value="신현대11차"> 신현대11차</label><label class="msel-opt"><input type="checkbox" value="신현대12차"> 신현대12차</label><label class="msel-opt"><input type="checkbox" value="신현대9차"> 신현대9차</label></div></div></div>
-        <div class="dvf"><label>평형 <span class="msN" id="msN_Py"></span></label>
-          <div class="msel" id="msPy"><button type="button" class="msel-btn" data-ms="Py">전체 평형</button><div class="msel-menu" hidden=""><label class="msel-opt hd msel-all"><input type="checkbox" data-all="1"> 전체</label><label class="msel-opt"><input type="checkbox" value="35"> 35평</label><label class="msel-opt"><input type="checkbox" value="36" checked=""> 36평</label><label class="msel-opt"><input type="checkbox" value="39"> 39평</label><label class="msel-opt"><input type="checkbox" value="50"> 50평</label><label class="msel-opt"><input type="checkbox" value="51"> 51평</label><label class="msel-opt"><input type="checkbox" value="56"> 56평</label><label class="msel-opt"><input type="checkbox" value="57"> 57평</label><label class="msel-opt"><input type="checkbox" value="60"> 60평</label><label class="msel-opt"><input type="checkbox" value="61"> 61평</label></div></div></div>
-        <div class="dvf"><label>동 <span class="msN" id="msN_Dong">(2)</span></label>
-          <div class="msel" id="msDong"><button type="button" class="msel-btn" data-ms="Dong">110동, 126동</button><div class="msel-menu" hidden=""><label class="msel-opt hd msel-all"><input type="checkbox" checked="" data-all="1"> 전체</label><label class="msel-opt"><input type="checkbox" value=""> 동</label><label class="msel-opt"><input type="checkbox" value="101"> 101동</label><label class="msel-opt"><input type="checkbox" value="102"> 102동</label><label class="msel-opt"><input type="checkbox" value="103"> 103동</label><label class="msel-opt"><input type="checkbox" value="104"> 104동</label><label class="msel-opt"><input type="checkbox" value="105"> 105동</label><label class="msel-opt"><input type="checkbox" value="106"> 106동</label><label class="msel-opt"><input type="checkbox" value="107"> 107동</label><label class="msel-opt"><input type="checkbox" value="108"> 108동</label><label class="msel-opt"><input type="checkbox" value="109"> 109동</label><label class="msel-opt"><input type="checkbox" value="110"> 110동</label><label class="msel-opt"><input type="checkbox" value="111"> 111동</label><label class="msel-opt"><input type="checkbox" value="112"> 112동</label><label class="msel-opt"><input type="checkbox" value="113"> 113동</label><label class="msel-opt"><input type="checkbox" value="114"> 114동</label><label class="msel-opt"><input type="checkbox" value="115"> 115동</label><label class="msel-opt"><input type="checkbox" value="116"> 116동</label><label class="msel-opt"><input type="checkbox" value="117"> 117동</label><label class="msel-opt"><input type="checkbox" value="118"> 118동</label><label class="msel-opt"><input type="checkbox" value="119"> 119동</label><label class="msel-opt"><input type="checkbox" value="120"> 120동</label><label class="msel-opt"><input type="checkbox" value="121"> 121동</label><label class="msel-opt"><input type="checkbox" value="122"> 122동</label><label class="msel-opt"><input type="checkbox" value="123"> 123동</label><label class="msel-opt"><input type="checkbox" value="124"> 124동</label><label class="msel-opt"><input type="checkbox" value="125"> 125동</label><label class="msel-opt"><input type="checkbox" value="126"> 126동</label><label class="msel-opt"><input type="checkbox" value="127"> 127동</label></div></div></div>
+        <div class="dvf"><label>평형 <span class="msN" id="msN_Py">(1)</span></label>
+          <div class="msel" id="msPy"><button type="button" class="msel-btn" data-ms="Py">56평</button><div class="msel-menu" hidden=""><label class="msel-opt hd msel-all"><input type="checkbox" checked="" data-all="1"> 전체</label><label class="msel-opt"><input type="checkbox" value="35"> 35평</label><label class="msel-opt"><input type="checkbox" value="36"> 36평</label><label class="msel-opt"><input type="checkbox" value="39"> 39평</label><label class="msel-opt"><input type="checkbox" value="50"> 50평</label><label class="msel-opt"><input type="checkbox" value="51"> 51평</label><label class="msel-opt"><input type="checkbox" value="56"> 56평</label><label class="msel-opt"><input type="checkbox" value="57"> 57평</label><label class="msel-opt"><input type="checkbox" value="60"> 60평</label><label class="msel-opt"><input type="checkbox" value="61"> 61평</label></div></div></div>
+        <div class="dvf"><label>동 <span class="msN" id="msN_Dong"></span></label>
+          <div class="msel" id="msDong"><button type="button" class="msel-btn" data-ms="Dong">전체 동</button><div class="msel-menu" hidden=""><label class="msel-opt hd msel-all"><input type="checkbox" checked="" data-all="1"> 전체</label><label class="msel-opt"><input type="checkbox" value="114"> 114동</label><label class="msel-opt"><input type="checkbox" value="120"> 120동</label><label class="msel-opt"><input type="checkbox" value="123"> 123동</label></div></div></div>
         <div class="dvf"><label>대지지분 <span class="msN" id="msN_Jib"></span></label>
-          <div class="msel" id="msJib"><button type="button" class="msel-btn" data-ms="Jib">전체 대지지분</button><div class="msel-menu" hidden=""><label class="msel-opt hd msel-all"><input type="checkbox" checked="" data-all="1"> 전체</label><label class="msel-opt"><input type="checkbox" value="18.90"> 18.90평 <span class="mso-sub">35·36평형</span></label></div></div></div>
+          <div class="msel" id="msJib"><button type="button" class="msel-btn" data-ms="Jib">전체 대지지분</button><div class="msel-menu" hidden=""><label class="msel-opt hd msel-all"><input type="checkbox" checked="" data-all="1"> 전체</label><label class="msel-opt"><input type="checkbox" value="28.76"> 28.76평 <span class="mso-sub">56평형</span></label></div></div></div>
         <div class="dvf"><label>거래유형</label><select id="dfType"><option value="">전체</option><option value="0">중개거래</option><option value="1">직거래</option><option value="2">해제</option></select></div>
         <div class="dvf"><label>기간(시작)</label><input type="month" id="dfFrom" min="2025-01" max="2026-11"></div>
         <div class="dvf"><label>기간(끝)</label><input type="month" id="dfTo" min="2025-01" max="2026-11"></div>
@@ -3247,34 +4486,41 @@ body.b-briefmode .b-printonly{display:block!important}
       </div>
       <div class="dv-filter-actions">
         <button id="dfReset" class="dv-reset">필터 초기화</button>
-        <span class="dv-count" id="dfCount">5건 검색됨</span>
+        <span class="dv-count" id="dfCount">13건 검색됨</span>
       </div>
     </div>
 
     <div class="bsec">
       <div class="ttl">검색 결과 요약</div>
       <div class="dv-cards">
-        <div class="dv-card"><div class="dk">거래 건수</div><div class="dvv" id="sCount">5건</div></div>
-        <div class="dv-card"><div class="dk">평균 매매가</div><div class="dvv" id="sAvg">61.54<span class="u">억</span></div></div>
-        <div class="dv-card dv-card-wide"><div class="dk">최고 / 최저 실거래</div><div id="sHiLo" class="hilo"><div class="hl-row"><span class="hl-tag hi">최고</span><b>65.00</b><span class="hl-u">억</span><span class="hl-meta">2025-12-24 · 신현대11차 35평 · 126동 1층</span></div><div class="hl-row"><span class="hl-tag lo">최저</span><b>57.90</b><span class="hl-u">억</span><span class="hl-meta">2026-09-30 · 신현대11차 35평 · 126동 4층</span></div></div></div>
-        <div class="dv-card"><div class="dk">평균 지분평당가</div><div class="dvv" id="sJpp">3.26<span class="u">억</span></div></div>
-        <div class="dv-card"><div class="dk">평균 공시가배수</div><div class="dvv" id="sMul">1.41<span class="u">배</span></div></div>
+        <div class="dv-card"><div class="dk">거래 건수</div><div class="dvv" id="sCount">13건</div></div>
+        <div class="dv-card"><div class="dk">평균 매매가</div><div class="dvv" id="sAvg">87.72<span class="u">억</span></div></div>
+        <div class="dv-card dv-card-wide"><div class="dk">최고 / 최저 실거래</div><div id="sHiLo" class="hilo"><div class="hl-row"><span class="hl-tag hi">최고</span><b>99.00</b><span class="hl-u">억</span><span class="hl-meta">2026-01-20 · 신현대12차 56평 · 123동 13층</span></div><div class="hl-row"><span class="hl-tag lo">최저</span><b>73.00</b><span class="hl-u">억</span><span class="hl-meta">2025-08-29 · 신현대12차 56평 · 120동 8층</span></div></div></div>
+        <div class="dv-card"><div class="dk">평균 지분평당가</div><div class="dvv" id="sJpp">3.05<span class="u">억</span></div></div>
+        <div class="dv-card"><div class="dk">평균 공시가배수</div><div class="dvv" id="sMul">1.21<span class="u">배</span></div></div>
       </div>
     </div>
 
     <div class="bsec">
-      <div class="ttl">구역별 · 평형별 최근 실거래가 매매 <small class="dv-note-inline" id="dvLatestScope">(검색결과 2개 · 비교 6개 · 30평대 구역별 최근 1건)</small></div>
-      <div class="dv-table-wrap"><table class="dv-table dv-latest" id="dvLatest"><colgroup><col class="c-cmp"><col class="c-kind"><col class="c-date"><col class="c-zone"><col class="c-cx"><col class="c-py"><col class="c-dong"><col class="c-fl"><col class="c-price"><col class="c-gongsi"><col class="c-mul"><col class="c-jib"><col class="c-jpp"><col class="c-type"></colgroup><thead><tr><th class="cmp-th">비교</th><th>구분</th><th>매매일</th><th>구역</th><th>단지</th><th>평</th><th>동</th><th>층</th><th>매매가(억)</th><th>공시가</th><th>공시배수</th><th>대지지분</th><th>지분평당가</th><th>거래유형</th></tr></thead><tbody><tr class="baserow"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-09-30|2|신현대11차|35|126|4|57.9|0#1"></td><td><span class="kb-base">검색결과</span></td><td class="">2026-09-30</td><td class="">2구역</td><td class="">신현대11차</td><td class="">35평</td><td class="">126</td><td class="">4</td><td class="mxp">57.90</td><td class="">44.18</td><td class="">1.31</td><td class="">18.90</td><td class="">3.06</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class="baserow"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2025-05-29|2|신현대11차|36|110|11|64.8|0#1"></td><td><span class="kb-base">검색결과</span></td><td class="">2025-05-29</td><td class="">2구역</td><td class="">신현대11차</td><td class="">36평</td><td class="">110</td><td class="">11</td><td class="mxp">64.80</td><td class="">44.53</td><td class="">1.46</td><td class="">18.90</td><td class="">3.43</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class="cmprow kbrk"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-05-22|1|미성2차|32|28|2|42|0#1"></td><td><span class="kb-cmp">비교</span></td><td class="">2026-05-22</td><td class="">1구역</td><td class="">미성2차</td><td class="">32평</td><td class="">28</td><td class="">2</td><td class="mxp">42.00</td><td class="">31.30</td><td class="">1.34</td><td class="">10.96</td><td class="">3.83</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class="cmprow"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-04-02|2|신현대12차|39|115|3|67|0#1"></td><td><span class="kb-cmp">비교</span></td><td class="">2026-04-02</td><td class="">2구역</td><td class="">신현대12차</td><td class="">39평</td><td class="">115</td><td class="">3</td><td class="mxp">67.00</td><td class="">45.51</td><td class="">1.47</td><td class="">20.25</td><td class="">3.31</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class="cmprow"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-11-13|3|현대14차|32|204|5|52.6|0#1"></td><td><span class="kb-cmp">비교</span></td><td class="">2026-11-13</td><td class="">3구역</td><td class="">현대14차</td><td class="">32평</td><td class="">204</td><td class="">5</td><td class="mxp">52.60</td><td class="">39.30</td><td class="">1.34</td><td class="">17.54</td><td class="">3.00</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class="cmprow"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-10-21|4|현대8차|35|91|2|46|0#1"></td><td><span class="kb-cmp">비교</span></td><td class="">2026-10-21</td><td class="">4구역</td><td class="">현대8차</td><td class="">35평</td><td class="">91</td><td class="">2</td><td class="mxp">46.00</td><td class="">35.65</td><td class="">1.29</td><td class="">19.12</td><td class="">2.41</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class="cmprow"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-06-12|5|한양1차|37|9|5|56.5|0#1"></td><td><span class="kb-cmp">비교</span></td><td class="">2026-06-12</td><td class="">5구역</td><td class="">한양1차</td><td class="">37평</td><td class="">9</td><td class="">5</td><td class="mxp">56.50</td><td class="">38.32</td><td class="">1.47</td><td class="">16.00</td><td class="">3.53</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class="cmprow"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-01-24|6|한양5차|32|52|5|53|0#1"></td><td><span class="kb-cmp">비교</span></td><td class="">2026-01-24</td><td class="">6구역</td><td class="">한양5차</td><td class="">32평</td><td class="">52</td><td class="">5</td><td class="mxp">53.00</td><td class="">29.72</td><td class="">1.78</td><td class="">15.09</td><td class="">3.51</td><td class=""><span class="tmid-b">중개</span></td></tr></tbody></table></div>
+      <div class="ttl">구역별 · 평형별 최근 실거래가 매매 <small class="dv-note-inline" id="dvLatestScope">(검색결과 1개 · 비교 6개 · 50평대 구역별 최근 1건)</small></div>
+      <div class="dv-table-wrap"><table class="dv-table dv-latest" id="dvLatest"><colgroup><col class="c-cmp"><col class="c-kind"><col class="c-date"><col class="c-zone"><col class="c-cx"><col class="c-py"><col class="c-dong"><col class="c-fl"><col class="c-price"><col class="c-gongsi"><col class="c-mul"><col class="c-jib"><col class="c-jpp"><col class="c-type"></colgroup><thead><tr><th class="cmp-th">비교</th><th>구분</th><th>매매일</th><th>구역</th><th>단지</th><th>평</th><th>동</th><th>층</th><th>매매가(억)</th><th>공시가</th><th>공시배수</th><th>대지지분</th><th>지분평당가</th><th>거래유형</th></tr></thead><tbody><tr class="baserow"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-10-17|2|신현대12차|56|120|11|82.9|0#1"></td><td><span class="kb-base">검색결과</span></td><td class="">2026-10-17</td><td class="">2구역</td><td class="">신현대12차</td><td class="">56평</td><td class="">120</td><td class="">11</td><td class="mxp">82.90</td><td class="">73.89</td><td class="">1.12</td><td class="">28.76</td><td class="">2.88</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class="cmprow kbrk"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-08-20|1|미성2차|56|22|2|57|0#1"></td><td><span class="kb-cmp">비교</span></td><td class="">2026-08-20</td><td class="">1구역</td><td class="">미성2차</td><td class="">56평</td><td class="">22</td><td class="">2</td><td class="mxp">57.00</td><td class="">47.25</td><td class="">1.21</td><td class="">20.75</td><td class="">2.75</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class="cmprow"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-10-24|2|신현대9차|50|106|4|69|0#1"></td><td><span class="kb-cmp">비교</span></td><td class="">2026-10-24</td><td class="">2구역</td><td class="">신현대9차</td><td class="">50평</td><td class="">106</td><td class="">4</td><td class="mxp">69.00</td><td class="">64.76</td><td class="">1.07</td><td class="">26.70</td><td class="">2.58</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class="cmprow"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-10-22|3|현대10차|50|201|10|70|0#1"></td><td><span class="kb-cmp">비교</span></td><td class="">2026-10-22</td><td class="">3구역</td><td class="">현대10차</td><td class="">50평</td><td class="">201</td><td class="">10</td><td class="mxp">70.00</td><td class="">56.31</td><td class="">1.24</td><td class="">25.11</td><td class="">2.79</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class="cmprow"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-10-17|4|현대8차|54|92|12|71.5|0#1"></td><td><span class="kb-cmp">비교</span></td><td class="">2026-10-17</td><td class="">4구역</td><td class="">현대8차</td><td class="">54평</td><td class="">92</td><td class="">12</td><td class="mxp">71.50</td><td class="">54.81</td><td class="">1.30</td><td class="">28.42</td><td class="">2.52</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class="cmprow"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-09-23|5|한양2차|59|25|8|78|0#1"></td><td><span class="kb-cmp">비교</span></td><td class="">2026-09-23</td><td class="">5구역</td><td class="">한양2차</td><td class="">59평</td><td class="">25</td><td class="">8</td><td class="mxp">78.00</td><td class="">58.94</td><td class="">1.32</td><td class="">29.54</td><td class="">2.64</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class="cmprow"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2025-03-18|6|한양5차|54|51|8|63|0#1"></td><td><span class="kb-cmp">비교</span></td><td class="">2025-03-18</td><td class="">6구역</td><td class="">한양5차</td><td class="">54평</td><td class="">51</td><td class="">8</td><td class="mxp">63.00</td><td class="">49.66</td><td class="">1.27</td><td class="">25.60</td><td class="">2.46</td><td class=""><span class="tmid-b">중개</span></td></tr></tbody></table></div>
       <p class="bnote">※ <span class="kb-base">검색결과</span> 행이 <b>위쪽에 모두 모여</b> 붉은 띠로 강조되고, 그 아래 <span class="kb-cmp">비교</span> 행이 이어집니다. 비교 행은 검색 결과와 <b>같은 평형대(10평 단위)에서 구역마다 가장 최근 거래 1건씩</b>만 보여줍니다. 예를 들어 39평을 검색하면 <b>각 구역의 30평대 최근 거래 1건씩</b>이 붙습니다. 비교 행은 구역·단지·평형·동·가격 조건을 무시하고 <b>기간·거래유형 조건만</b> 적용합니다. 컬럼 구성과 표기 방식은 아래 「실거래가 매매 내역」과 동일합니다.</p>
     </div>
 
 
     <div class="bsec">
       <div class="row" style="display:flex;justify-content:space-between;align-items:center;gap:10px">
-        <div class="ttl" style="margin:0">실거래가 매매 내역 <span class="cnt" id="dvTblCnt">5건</span></div>
+        <div class="ttl" style="margin:0">실거래가 매매 내역 <span class="cnt" id="dvTblCnt">13건</span></div>
       </div>
-      <div class="dv-table-wrap"><table class="dv-table" id="dvTable"><colgroup><col class="c-cmp"><col class="c-date"><col class="c-zone"><col class="c-cx"><col class="c-py"><col class="c-dong"><col class="c-fl"><col class="c-price"><col class="c-diff"><col class="c-gongsi"><col class="c-mul"><col class="c-jib"><col class="c-jpp"><col class="c-type"></colgroup><thead><tr><th class="cmp-th">비교</th><th data-k="date">매매일<span class="ar">▼</span></th><th data-k="zone">구역<span class="ar"></span></th><th data-k="cx">단지<span class="ar"></span></th><th data-k="py">평<span class="ar"></span></th><th data-k="dong">동<span class="ar"></span></th><th data-k="fl">층<span class="ar"></span></th><th data-k="price">매매가(억)<span class="ar"></span></th><th data-k="diff">직전 대비<span class="ar"></span></th><th data-k="gongsi">공시가<span class="ar"></span></th><th data-k="mul">공시배수<span class="ar"></span></th><th data-k="jib">대지지분<span class="ar"></span></th><th data-k="jpp">지분평당가<span class="ar"></span></th><th data-k="type">거래유형<span class="ar"></span></th></tr></thead><tbody><tr class=" txrow" data-txi="0"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-09-30|2|신현대11차|35|126|4|57.9|0#1"></td><td class="">2026-09-30</td><td class="">2구역</td><td class="">신현대11차</td><td class="">35평</td><td class="">126</td><td class="">4</td><td class="mxp">57.90</td><td class=""><span class="dup">▲2.40 <small>+4.3%</small></span></td><td class="">44.18</td><td class="">1.31</td><td class="">18.90</td><td class="">3.06</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class=" txrow" data-txi="1"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-05-23|2|신현대11차|35|126|5|58|0#1"></td><td class="">2026-05-23</td><td class="">2구역</td><td class="">신현대11차</td><td class="">35평</td><td class="">126</td><td class="">5</td><td class="mxp">58.00</td><td class=""><span class="ddn">▼4.90 <small>-7.8%</small></span></td><td class="">44.18</td><td class="">1.31</td><td class="">18.90</td><td class="">3.07</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class="top txrow" data-txi="2"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2025-12-24|2|신현대11차|35|126|1|65|0#1"></td><td class="">2025-12-24</td><td class="">2구역</td><td class="">신현대11차</td><td class="">35평</td><td class="">126</td><td class="">1</td><td class="mxp"><span class="topmark" title="동일 구역·평형 최고 실거래가">★</span>65.00</td><td class=""><span class="dup">▲5.00 <small>+8.3%</small></span></td><td class="">41.43</td><td class="">1.57</td><td class="">18.90</td><td class="">3.44</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class=" txrow" data-txi="3"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2025-05-29|2|신현대11차|36|110|11|64.8|0#1"></td><td class="">2025-05-29</td><td class="">2구역</td><td class="">신현대11차</td><td class="">36평</td><td class="">110</td><td class="">11</td><td class="mxp">64.80</td><td class=""><span class="dz">—</span></td><td class="">44.53</td><td class="">1.46</td><td class="">18.90</td><td class="">3.43</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class=" txrow" data-txi="4"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2025-04-10|2|신현대11차|35|126|3|62|0#1"></td><td class="">2025-04-10</td><td class="">2구역</td><td class="">신현대11차</td><td class="">35평</td><td class="">126</td><td class="">3</td><td class="mxp">62.00</td><td class=""><span class="dup">▲2.00 <small>+3.3%</small></span></td><td class="">43.48</td><td class="">1.43</td><td class="">18.90</td><td class="">3.28</td><td class=""><span class="tmid-b">중개</span></td></tr></tbody></table></div>
+      <div class="dv-table-wrap"><table class="dv-table" id="dvTable"><colgroup><col class="c-cmp"><col class="c-date"><col class="c-zone"><col class="c-cx"><col class="c-py"><col class="c-dong"><col class="c-fl"><col class="c-price"><col class="c-diff"><col class="c-gongsi"><col class="c-mul"><col class="c-jib"><col class="c-jpp"><col class="c-type"></colgroup><thead><tr><th class="cmp-th">비교</th><th data-k="date">매매일<span class="ar">▼</span></th><th data-k="zone">구역<span class="ar"></span></th><th data-k="cx">단지<span class="ar"></span></th><th data-k="py">평<span class="ar"></span></th><th data-k="dong">동<span class="ar"></span></th><th data-k="fl">층<span class="ar"></span></th><th data-k="price">매매가(억)<span class="ar"></span></th><th data-k="diff">직전 대비<span class="ar"></span></th><th data-k="gongsi">공시가<span class="ar"></span></th><th data-k="mul">공시배수<span class="ar"></span></th><th data-k="jib">대지지분<span class="ar"></span></th><th data-k="jpp">지분평당가<span class="ar"></span></th><th data-k="type">거래유형<span class="ar"></span></th></tr></thead><tbody><tr class=" txrow" data-txi="0"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-10-17|2|신현대12차|56|120|11|82.9|0#1"></td><td class="">2026-10-17</td><td class="">2구역</td><td class="">신현대12차</td><td class="">56평</td><td class="">120</td><td class="">11</td><td class="mxp">82.90</td><td class=""><span class="ddn">▼8.60 <small>-9.4%</small></span></td><td class="">73.89</td><td class="">1.12</td><td class="">28.76</td><td class="">2.88</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class=" txrow" data-txi="1"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-07-23|2|신현대12차|56|123|10|91.5|0#1"></td><td class="">2026-07-23</td><td class="">2구역</td><td class="">신현대12차</td><td class="">56평</td><td class="">123</td><td class="">10</td><td class="mxp">91.50</td><td class=""><span class="ddn">▼1.50 <small>-1.6%</small></span></td><td class="">73.89</td><td class="">1.24</td><td class="">28.76</td><td class="">3.18</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class=" txrow" data-txi="2"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-07-04|2|신현대12차|56|123|3|93|0#1"></td><td class="">2026-07-04</td><td class="">2구역</td><td class="">신현대12차</td><td class="">56평</td><td class="">123</td><td class="">3</td><td class="mxp">93.00</td><td class=""><span class="dup">▲9.00 <small>+10.7%</small></span></td><td class="">70.68</td><td class="">1.32</td><td class="">28.76</td><td class="">3.23</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class=" txrow" data-txi="3"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-05-08|2|신현대12차|56|123|5|84|0#1"></td><td class="">2026-05-08</td><td class="">2구역</td><td class="">신현대12차</td><td class="">56평</td><td class="">123</td><td class="">5</td><td class="mxp">84.00</td><td class=""><span class="dup">▲1.00 <small>+1.2%</small></span></td><td class="">71.88</td><td class="">1.17</td><td class="">28.76</td><td class="">2.92</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class=" txrow" data-txi="4"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-04-27|2|신현대12차|56|123|1|83|0#1"></td><td class="">2026-04-27</td><td class="">2구역</td><td class="">신현대12차</td><td class="">56평</td><td class="">123</td><td class="">1</td><td class="mxp">83.00</td><td class=""><span class="ddn">▼2.00 <small>-2.4%</small></span></td><td class="">67.26</td><td class="">1.23</td><td class="">28.76</td><td class="">2.89</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class=" txrow" data-txi="5"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-04-13|2|신현대12차|56|120|9|85|0#1"></td><td class="">2026-04-13</td><td class="">2구역</td><td class="">신현대12차</td><td class="">56평</td><td class="">120</td><td class="">9</td><td class="mxp">85.00</td><td class=""><span class="ddn">▼14.00 <small>-14.1%</small></span></td><td class="">73.89</td><td class="">1.15</td><td class="">28.76</td><td class="">2.96</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class="top txrow" data-txi="6"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2026-01-20|2|신현대12차|56|123|13|99|0#1"></td><td class="">2026-01-20</td><td class="">2구역</td><td class="">신현대12차</td><td class="">56평</td><td class="">123</td><td class="">13</td><td class="mxp"><span class="topmark" title="동일 구역·평형 최고 실거래가">★</span>99.00</td><td class=""><span class="dup">▲26.00 <small>+35.6%</small></span></td><td class="">72.92</td><td class="">1.36</td><td class="">28.76</td><td class="">3.44</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class=" txrow" data-txi="7"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2025-08-29|2|신현대12차|56|120|8|73|0#1"></td><td class="">2025-08-29</td><td class="">2구역</td><td class="">신현대12차</td><td class="">56평</td><td class="">120</td><td class="">8</td><td class="mxp">73.00</td><td class=""><span class="ddn">▼20.00 <small>-21.5%</small></span></td><td class="">73.89</td><td class="">0.99</td><td class="">28.76</td><td class="">2.54</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class=" txrow" data-txi="8"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2025-08-26|2|신현대12차|56|120|10|93|0#1"></td><td class="">2025-08-26</td><td class="">2구역</td><td class="">신현대12차</td><td class="">56평</td><td class="">120</td><td class="">10</td><td class="mxp">93.00</td><td class=""><span class="ddn">▼4.00 <small>-4.1%</small></span></td><td class="">73.89</td><td class="">1.26</td><td class="">28.76</td><td class="">3.23</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class=" txrow" data-txi="9"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2025-07-02|2|신현대12차|56|114|10|97|0#1"></td><td class="">2025-07-02</td><td class="">2구역</td><td class="">신현대12차</td><td class="">56평</td><td class="">114</td><td class="">10</td><td class="mxp">97.00</td><td class=""><span class="dup">▲4.00 <small>+4.3%</small></span></td><td class="">73.89</td><td class="">1.31</td><td class="">28.76</td><td class="">3.37</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class=" txrow" data-txi="10"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2025-04-30|2|신현대12차|56|114|11|93|0#1"></td><td class="">2025-04-30</td><td class="">2구역</td><td class="">신현대12차</td><td class="">56평</td><td class="">114</td><td class="">11</td><td class="mxp">93.00</td><td class=""><span class="dup">▲5.00 <small>+5.7%</small></span></td><td class="">73.89</td><td class="">1.26</td><td class="">28.76</td><td class="">3.23</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class=" txrow" data-txi="11"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2025-04-23|2|신현대12차|56|120|3|88|0#1"></td><td class="">2025-04-23</td><td class="">2구역</td><td class="">신현대12차</td><td class="">56평</td><td class="">120</td><td class="">3</td><td class="mxp">88.00</td><td class=""><span class="dup">▲10.00 <small>+12.8%</small></span></td><td class="">70.68</td><td class="">1.25</td><td class="">28.76</td><td class="">3.06</td><td class=""><span class="tmid-b">중개</span></td></tr><tr class=" txrow" data-txi="12"><td class="cmp-td"><input type="checkbox" class="cmpcb" title="비교함에 담기" data-k="D|2025-02-13|2|신현대12차|56|120|12|78|0#1"></td><td class="">2025-02-13</td><td class="">2구역</td><td class="">신현대12차</td><td class="">56평</td><td class="">120</td><td class="">12</td><td class="mxp">78.00</td><td class=""><span class="dz">—</span></td><td class="">73.89</td><td class="">1.06</td><td class="">28.76</td><td class="">2.71</td><td class=""><span class="tmid-b">중개</span></td></tr></tbody></table></div>
       <p class="bnote">※ 컬럼 헤더를 클릭하면 정렬됩니다(다시 클릭 시 오름/내림 전환). <b>지분평당가</b>는 대지지분 1평당 매매가로, 재건축 실질가치 비교의 핵심 지표입니다. 맨 왼쪽 <b>「비교」</b>를 체크하면 오른쪽 아래 <b>비교함</b>에 모여 나란히 비교됩니다. <span class="tdir-mini">직거래</span>는 특수관계 거래일 수 있어 시세 판단 시 주의하세요.</p>
+    </div>
+
+    <div class="bsec" id="dvChartSec">
+      <div class="ttl">실거래가 매매 추이 <small class="dv-note-inline" id="dvChartMeta">(13건 · 월평균 선 + 개별 거래 점)</small></div>
+      <div class="dvc-leg" id="dvChartLeg"><span><i class="dvc-dot" style="background:#7C8A91;opacity:.6"></i>개별 거래(중개)</span><span><i class="dvc-dot" style="background:#C2552E"></i>최고가</span><span><i class="dvc-ln" style="background:#1F5FA8"></i>월평균</span><span><i class="dvc-ln dash"></i>최근 3건 평균</span></div>
+      <div class="dvc-wrap"><div id="dvChartBody"><svg class="dvc-svg" viewBox="0 0 720 340" role="img" aria-label="실거래가 매매 추이 꺾은선 그래프"><line x1="46" x2="704" y1="310.0" y2="310.0" stroke="#E2DED2"></line><text x="39" y="314.0" text-anchor="end" font-size="11" fill="#7C8A91">70</text><line x1="46" x2="704" y1="238.5" y2="238.5" stroke="#E2DED2"></line><text x="39" y="242.5" text-anchor="end" font-size="11" fill="#7C8A91">80</text><line x1="46" x2="704" y1="167.0" y2="167.0" stroke="#E2DED2"></line><text x="39" y="171.0" text-anchor="end" font-size="11" fill="#7C8A91">90</text><line x1="46" x2="704" y1="95.5" y2="95.5" stroke="#E2DED2"></line><text x="39" y="99.5" text-anchor="end" font-size="11" fill="#7C8A91">100</text><line x1="46" x2="704" y1="24.0" y2="24.0" stroke="#E2DED2"></line><text x="39" y="28.0" text-anchor="end" font-size="11" fill="#7C8A91">110</text><text x="39" y="12" text-anchor="end" font-size="10" fill="#7C8A91">억</text><text x="46.0" y="331" text-anchor="middle" font-size="11" fill="#7C8A91">25.2</text><text x="233.6" y="331" text-anchor="middle" font-size="11" fill="#7C8A91">25.8</text><text x="424.2" y="331" text-anchor="middle" font-size="11" fill="#7C8A91">26.2</text><text x="611.8" y="331" text-anchor="middle" font-size="11" fill="#7C8A91">26.8</text><path d="M60.5,252.8 L121.6,163.4 L215.9,117.0 L248.1,217.1 L406.6,102.7 L499.9,209.9 L531.0,209.9 L594.2,150.9 L689.5,217.8 L689.5,310.0 L60.5,310.0Z" fill="#1F5FA8" opacity=".09"></path><path d="M60.5,252.8 L121.6,163.4 L215.9,117.0 L248.1,217.1 L406.6,102.7 L499.9,209.9 L531.0,209.9 L594.2,150.9 L689.5,217.8" fill="none" stroke="#1F5FA8" stroke-width="2.6" stroke-linejoin="round" stroke-linecap="round"></path><circle cx="60.5" cy="252.8" r="4" fill="#fff" stroke="#1F5FA8" stroke-width="2"></circle><circle cx="121.6" cy="163.4" r="4" fill="#fff" stroke="#1F5FA8" stroke-width="2"></circle><circle cx="215.9" cy="117.0" r="4" fill="#fff" stroke="#1F5FA8" stroke-width="2"></circle><circle cx="248.1" cy="217.1" r="4" fill="#fff" stroke="#1F5FA8" stroke-width="2"></circle><circle cx="406.6" cy="102.7" r="4" fill="#fff" stroke="#1F5FA8" stroke-width="2"></circle><circle cx="499.9" cy="209.9" r="4" fill="#fff" stroke="#1F5FA8" stroke-width="2"></circle><circle cx="531.0" cy="209.9" r="4" fill="#fff" stroke="#1F5FA8" stroke-width="2"></circle><circle cx="594.2" cy="150.9" r="4" fill="#fff" stroke="#1F5FA8" stroke-width="2"></circle><circle cx="689.5" cy="217.8" r="4" fill="#fff" stroke="#1F5FA8" stroke-width="2"></circle><circle cx="58.4" cy="252.8" r="3" fill="#6B7F8C" opacity="0.85"></circle><circle cx="129.9" cy="181.3" r="3" fill="#6B7F8C" opacity="0.85"></circle><circle cx="137.2" cy="145.6" r="3" fill="#6B7F8C" opacity="0.85"></circle><circle cx="202.5" cy="117.0" r="3" fill="#6B7F8C" opacity="0.85"></circle><circle cx="259.5" cy="145.6" r="3" fill="#6B7F8C" opacity="0.85"></circle><circle cx="262.6" cy="288.6" r="3" fill="#6B7F8C" opacity="0.85"></circle><circle cx="411.8" cy="102.7" r="3" fill="#6B7F8C" opacity="0.85"></circle><circle cx="497.8" cy="202.8" r="3" fill="#6B7F8C" opacity="0.85"></circle><circle cx="512.3" cy="217.1" r="3" fill="#6B7F8C" opacity="0.85"></circle><circle cx="523.7" cy="209.9" r="3" fill="#6B7F8C" opacity="0.85"></circle><circle cx="582.8" cy="145.6" r="3" fill="#6B7F8C" opacity="0.85"></circle><circle cx="602.5" cy="156.3" r="3" fill="#6B7F8C" opacity="0.85"></circle><circle cx="691.6" cy="217.8" r="3" fill="#6B7F8C" opacity="0.85"></circle><line x1="46" x2="704" y1="173.2" y2="173.2" stroke="#1F5FA8" stroke-dasharray="4 4" opacity=".8"></line><text x="52" y="167.2" font-size="11" font-weight="800" fill="#1F5FA8" paint-order="stroke" stroke="#fff" stroke-width="3.5" stroke-linejoin="round">최근 3건 평균 89.13억</text><text x="681.5" y="205.8" text-anchor="end" font-size="11.5" font-weight="800" fill="#1F5FA8" paint-order="stroke" stroke="#fff" stroke-width="3.5" stroke-linejoin="round">26.10 월평균 82.90억</text><circle class="dvc-hit" data-i="0" cx="60.5" cy="252.8" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="1" cx="121.6" cy="163.4" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="2" cx="215.9" cy="117.0" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="3" cx="248.1" cy="217.1" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="4" cx="406.6" cy="102.7" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="5" cx="499.9" cy="209.9" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="6" cx="531.0" cy="209.9" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="7" cx="594.2" cy="150.9" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="8" cx="689.5" cy="217.8" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="9" cx="58.4" cy="252.8" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="10" cx="129.9" cy="181.3" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="11" cx="137.2" cy="145.6" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="12" cx="202.5" cy="117.0" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="13" cx="259.5" cy="145.6" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="14" cx="262.6" cy="288.6" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="15" cx="411.8" cy="102.7" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="16" cx="497.8" cy="202.8" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="17" cx="512.3" cy="217.1" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="18" cx="523.7" cy="209.9" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="19" cx="582.8" cy="145.6" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="20" cx="602.5" cy="156.3" r="9" fill="transparent"></circle><circle class="dvc-hit" data-i="21" cx="691.6" cy="217.8" r="9" fill="transparent"></circle><circle cx="411.8" cy="102.7" r="6" fill="#C2552E" stroke="#fff" stroke-width="2"></circle><text x="421.8" y="93.7" text-anchor="start" font-size="11.5" font-weight="800" fill="#C2552E" paint-order="stroke" stroke="#fff" stroke-width="3.5" stroke-linejoin="round">최고 99.00억</text><circle class="dvc-hit" data-i="22" cx="411.8" cy="102.7" r="9" fill="transparent"></circle></svg></div><div class="dvc-tip" id="dvChartTip" style="left: 776.77px; top: 149.315px;" hidden=""><b>2026-07-04</b> · 2구역 신현대12차 56평<br>123동 3층 · <b>93.00억</b></div></div>
+      <p class="bnote">※ <b>점 하나가 실제 거래 1건</b>입니다. 한 묶음만 보면 굵은 선이 월평균이고, 점선은 최근 3건 평균입니다. 같은 평형이라도 <b>동·층·향에 따라 가격 차이가 커서</b> 선만 보고 오르내림을 단정하지 마시고, 점에 마우스를 올리거나 터치해 동·층을 확인하세요. 해제 거래는 제외하며, <span class="tdir-mini">직거래</span>는 호박색으로 따로 표시합니다. 구역·평형·단지를 2개 이상 고르면 묶음별 선으로 바뀝니다(최대 6개).</p>
     </div>
   </div><!--/dealView-->
 
@@ -8489,7 +9735,7 @@ async function exportHTML(){
     html = html.replace(/<div class="bsec lsec-fold" id="lsSumOthSec"[^>]*>/,'<div class="bsec lsec-fold" id="lsSumOthSec" hidden="">');
     html = html.replace(/<input type="checkbox" id="lShowSumOth"[^>]*>/,'<input type="checkbox" id="lShowSumOth">');
     html = html.replace(/<label class="lcolopt sec"><input type="checkbox" id="lShowSumOth">/,'<label class="lcolopt sec"><input type="checkbox" id="lShowSumOth">');
-    html = html.replace(/(<div class="dv-table-wrap" id="lsTableWrap" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="")(?![^>]*hidden)/,'$1 hidden=""');
+    html = html.replace(/(<div class="dv-table-wrap" id="lsTableWrap" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="" hidden="")(?![^>]*hidden)/,'$1 hidden=""');
     // 조건 칩 · 페이지 · 빠른검색 안내도 '검색 전' 상태로 비워 둔다
     html = html.replace(/<div class="lchips" id="lChips"[^>]*>[\s\S]*?<\/div>/,'<div class="lchips" id="lChips" hidden=""></div>');
     html = html.replace(/<div class="lpager" id="lsPager"[^>]*>[\s\S]*?<\/div>/,'<div class="lpager" id="lsPager" hidden=""></div>');
@@ -8836,6 +10082,7 @@ function dvRender(){
     + (haeN? ` <span class="hae-note">(해제 ${haeN}건 · 통계 제외)</span>` : '')
     + (haeOnly? ` <span class="hae-note">(해제 거래만 표시 중)</span>` : '');
   dvSummary(stat); dvLatest(stat); dvTable(rows);
+  try{ dvChart(stat,haeOnly); }catch(e){ console.warn("[압구정] 추이 그래프 오류",e); }
 }
 
 function dvSummary(rows){
@@ -9023,6 +10270,109 @@ function dvTable(rows){
     };
   });
 }
+/* ===== 실거래가 매매 추이 그래프 — 기본: 월평균 선 + 개별 거래 점 + 최근 3건 평균 / 묶음이 2개 이상이면 다중선 ===== */
+const DVC={W:720,H:340,ml:46,mr:16,mt:24,mb:30,tips:[]};
+const DVC_ST=[{c:'#1F5FA8',s:'c',d:''},{c:'#6B7F8C',s:'s',d:'6 4'},{c:'#7A4EA3',s:'t',d:''},{c:'#8A6D5A',s:'d',d:'6 4'},{c:'#0E8A9E',s:'c',d:'2 3'},{c:'#9A8FA8',s:'s',d:''}];
+function dvcMark(s,x,y,f){
+  x=x.toFixed(1); y=y.toFixed(1); const a=+x, b=+y;
+  if(s==='s') return `<rect x="${a-3.6}" y="${b-3.6}" width="7.2" height="7.2" fill="${f}" stroke="#fff" stroke-width="1.2"/>`;
+  if(s==='t') return `<path d="M${a},${b-4.8} l4.8,8.4 h-9.6z" fill="${f}" stroke="#fff" stroke-width="1.2"/>`;
+  if(s==='d') return `<path d="M${a},${b-5} l5,5 l-5,5 l-5,-5z" fill="${f}" stroke="#fff" stroke-width="1.2"/>`;
+  return `<circle cx="${a}" cy="${b}" r="3.8" fill="${f}" stroke="#fff" stroke-width="1.2"/>`;
+}
+function dvChart(rows,haeOnly){
+  const box=$('dvChartBody'); if(!box) return;
+  const meta=$('dvChartMeta'), leg=$('dvChartLeg'), tip=$('dvChartTip');
+  tip.hidden=true; DVC.tips=[]; leg.innerHTML='';
+  const msg=t=>{ box.innerHTML='<div class="dvc-empty">'+t+'</div>'; meta.textContent=''; };
+  if(haeOnly) return msg('거래유형을 「해제」로 고르면 그래프를 그리지 않습니다. 중개·직거래 거래만 추이로 봅니다.');
+  const R=rows.slice().sort((a,b)=>a[2]<b[2]?-1:a[2]>b[2]?1:0);
+  if(R.length<2) return msg(R.length?'거래가 1건뿐이라 추이를 그릴 수 없습니다.':'검색 결과가 없습니다. 조건을 완화해 보세요.');
+  const vZ=new Set(R.map(d=>d[0])).size>1, vP=new Set(R.map(d=>d[3])).size>1, vC=!vZ&&new Set(R.map(d=>d[1])).size>1;
+  const multi=vZ||vP||vC;
+  const sk=d=>[vZ?d[0]+'구역':'',vP?d[3]+'평':'',vC?d[1]:''].filter(Boolean).join(' ');
+  const first={}; R.forEach(d=>{ const k=sk(d); if(!first[k]) first[k]=d; });
+  const keys=Object.keys(first).sort((a,b)=>{ const x=first[a],y=first[b]; return (+x[0])-(+y[0])||x[3]-y[3]||x[1].localeCompare(y[1],'ko'); });
+  if(multi && keys.length>6) return msg('선택 조건이 <b>'+keys.length+'개 묶음</b>(구역·평형·단지)이라 선이 너무 많습니다.<br>구역·평형·단지를 좁혀 <b>6개 이하</b>로 고르면 그래프가 그려집니다.');
+  const {W,H,ml,mr,mt,mb}=DVC;
+  const D=s=>Date.UTC(+s.slice(0,4),+s.slice(5,7)-1,+s.slice(8,10))/864e5;
+  const t0=D(R[0][2])-12, t1=D(R[R.length-1][2])+12;
+  const X=s=>ml+(D(s)-t0)/(t1-t0)*(W-ml-mr);
+  const pr=R.map(d=>d[6]); const lo=Math.min(...pr), hi=Math.max(...pr), sp=Math.max(hi-lo,1);
+  const step=[1,2,5,10,20,50].find(s=>sp/s<=5)||50;
+  const y0=Math.floor((lo-sp*.06)/step)*step, y1=Math.ceil((hi+sp*.12)/step)*step;
+  const Y=v=>mt+(y1-v)/(y1-y0)*(H-mt-mb);
+  const reg=h=>{ DVC.tips.push(h); return DVC.tips.length-1; };
+  const tipDeal=d=>`<b>${d[2]}</b> · ${d[0]}구역 ${d[1]} ${d[3]}평<br>${d[4]}동 ${d[5]}층 · <b>${n2(d[6])}억</b>${d[8]===1?' <span class="dvc-dir">직거래</span>':''}`;
+  const hit=(x,y,h)=>`<circle class="dvc-hit" data-i="${reg(h)}" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="9" fill="transparent"/>`;
+  const halo='paint-order="stroke" stroke="#fff" stroke-width="3.5" stroke-linejoin="round"';
+  let s='';
+  for(let v=y0; v<=y1+1e-9; v+=step){
+    s+=`<line x1="${ml}" x2="${W-mr}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" stroke="#E2DED2"/><text x="${ml-7}" y="${(Y(v)+4).toFixed(1)}" text-anchor="end" font-size="11" fill="#7C8A91">${v}</text>`;
+  }
+  s+=`<text x="${ml-7}" y="12" text-anchor="end" font-size="10" fill="#7C8A91">억</text>`;
+  const ms=[]; { const a=new Date(t0*864e5); let y=a.getUTCFullYear(), m=a.getUTCMonth()+1;
+    for(let i=0;i<60;i++){ const k=y+'-'+String(m).padStart(2,'0')+'-01'; if(D(k)>t1) break; if(D(k)>=t0) ms.push([y,m,k]); if(++m>12){ m=1; y++; } } }
+  const sm=ms.length>16?6:ms.length>8?3:ms.length>4?2:1;
+  ms.forEach((q,i)=>{ if(i%sm) return; s+=`<text x="${X(q[2]).toFixed(1)}" y="${H-9}" text-anchor="middle" font-size="11" fill="#7C8A91">${String(q[0]).slice(2)}.${q[1]}</text>`; });
+  const top=R.reduce((a,b)=>b[6]>a[6]?b:a);
+  const topMark=()=>{ const x=X(top[2]), y=Y(top[6]), end=x>W*.7, ty=y<mt+14? y+19 : y-9;
+    return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="6" fill="#C2552E" stroke="#fff" stroke-width="2"/><text x="${(x+(end?-10:10)).toFixed(1)}" y="${ty.toFixed(1)}" text-anchor="${end?'end':'start'}" font-size="11.5" font-weight="800" fill="#C2552E" ${halo}>최고 ${n2(top[6])}억</text>`+hit(x,y,tipDeal(top)+'<br>★ 이 검색결과의 최고가'); };
+  let metaTxt, lg;
+  const hasDir=R.some(d=>d[8]===1);
+  const dirLg=hasDir?'<span><i class="dvc-dot" style="background:#B98900"></i>직거래(시세 판단 주의)</span>':'';
+  if(!multi){
+    const mo={}; R.forEach(d=>{ const k=d[2].slice(0,7); (mo[k]=mo[k]||[]).push(d); });
+    const M=Object.keys(mo).sort().map(k=>{ const a=mo[k], p=a.map(d=>d[6]); return {k,x:X(k+'-15'),avg:p.reduce((u,v)=>u+v,0)/a.length,n:a.length,lo:Math.min(...p),hi:Math.max(...p)}; });
+    const r3=R.slice(-3), av3=r3.reduce((u,d)=>u+d[6],0)/r3.length;
+    if(M.length>=2){
+      const ln=M.map((m,i)=>(i?'L':'M')+m.x.toFixed(1)+','+Y(m.avg).toFixed(1)).join(' ');
+      s+=`<path d="${ln} L${M[M.length-1].x.toFixed(1)},${Y(y0).toFixed(1)} L${M[0].x.toFixed(1)},${Y(y0).toFixed(1)}Z" fill="#1F5FA8" opacity=".09"/>`;
+    }
+    if(M.length>=2){
+      s+=`<path d="${M.map((m,i)=>(i?'L':'M')+m.x.toFixed(1)+','+Y(m.avg).toFixed(1)).join(' ')}" fill="none" stroke="#1F5FA8" stroke-width="2.6" stroke-linejoin="round" stroke-linecap="round"/>`;
+    }
+    M.forEach(m=>{ s+=`<circle cx="${m.x.toFixed(1)}" cy="${Y(m.avg).toFixed(1)}" r="4" fill="#fff" stroke="#1F5FA8" stroke-width="2"/>`; });
+    R.forEach(d=>{ s+=`<circle cx="${X(d[2]).toFixed(1)}" cy="${Y(d[6]).toFixed(1)}" r="3" fill="${d[8]===1?'#B98900':'#6B7F8C'}" opacity="${d[8]===1?1:.85}"/>`; });
+    if(R.length>=3){
+      s+=`<line x1="${ml}" x2="${W-mr}" y1="${Y(av3).toFixed(1)}" y2="${Y(av3).toFixed(1)}" stroke="#1F5FA8" stroke-dasharray="4 4" opacity=".8"/><text x="${ml+6}" y="${(Y(av3)-6).toFixed(1)}" font-size="11" font-weight="800" fill="#1F5FA8" ${halo}>최근 3건 평균 ${n2(av3)}억</text>`;
+    }
+    const lm=M[M.length-1];
+    s+=`<text x="${(lm.x-8).toFixed(1)}" y="${(Y(lm.avg)-12).toFixed(1)}" text-anchor="end" font-size="11.5" font-weight="800" fill="#1F5FA8" ${halo}>${lm.k.slice(2).replace('-','.')} 월평균 ${n2(lm.avg)}억</text>`;
+    /* 월평균 hit를 먼저 깔고 개별 거래 hit를 위에 둔다 — 겹치면 개별 거래 정보가 우선 */
+    M.forEach(m=>{ s+=hit(m.x,Y(m.avg),`<b>${m.k.replace('-','.')} 월평균 ${n2(m.avg)}억</b><br>${m.n}건 · ${n2(m.lo)}~${n2(m.hi)}억`); });
+    R.forEach(d=>{ s+=hit(X(d[2]),Y(d[6]),tipDeal(d)); });
+    s+=topMark();
+    metaTxt=`(${R.length}건 · 월평균 선 + 개별 거래 점)`;
+    lg=`<span><i class="dvc-dot" style="background:#7C8A91;opacity:.6"></i>개별 거래(중개)</span>${dirLg}<span><i class="dvc-dot" style="background:#C2552E"></i>최고가</span><span><i class="dvc-ln" style="background:#1F5FA8"></i>월평균</span><span><i class="dvc-ln dash"></i>최근 3건 평균</span>`;
+  }else{
+    lg='';
+    keys.forEach((k,i)=>{
+      const st=DVC_ST[i], pts=R.filter(d=>sk(d)===k);
+      s+=`<path d="${pts.map((d,j)=>(j?'L':'M')+X(d[2]).toFixed(1)+','+Y(d[6]).toFixed(1)).join(' ')}" fill="none" stroke="${st.c}" stroke-width="1.8" stroke-dasharray="${st.d}" stroke-linejoin="round"/>`;
+      pts.forEach(d=>{ s+=dvcMark(st.s,X(d[2]),Y(d[6]),d[8]===1?'#B98900':st.c); });
+      lg+=`<span><svg width="26" height="10"><line x1="0" x2="26" y1="5" y2="5" stroke="${st.c}" stroke-width="2" stroke-dasharray="${st.d}"/></svg>${k} <b>${pts.length}건</b></span>`;
+    });
+    R.forEach(d=>{ s+=hit(X(d[2]),Y(d[6]),tipDeal(d)); });
+    s+=topMark();
+    lg+=dirLg+'<span><i class="dvc-dot" style="background:#C2552E"></i>최고가</span>';
+    metaTxt=`(${R.length}건 · ${vZ&&vP?'구역·평형별':vZ?'구역별':vP?'평형별':'단지별'} 선)`;
+  }
+  box.innerHTML=`<svg class="dvc-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="실거래가 매매 추이 꺾은선 그래프">${s}</svg>`;
+  meta.textContent=metaTxt; leg.innerHTML=lg;
+  const show=el=>{
+    tip.innerHTML=DVC.tips[+el.getAttribute('data-i')]; tip.hidden=false;
+    const b=box.getBoundingClientRect(), r=el.getBoundingClientRect();
+    tip.style.left='0px'; tip.style.top='0px';
+    const tw=tip.offsetWidth, th=tip.offsetHeight;
+    let l=r.left+r.width/2-b.left-tw/2; l=Math.max(2,Math.min(l,b.width-tw-2));
+    let t=r.top-b.top-th-8; if(t<0) t=r.bottom-b.top+8;
+    tip.style.left=l+'px'; tip.style.top=t+'px';
+  };
+  const on=e=>{ const el=e.target.closest&&e.target.closest('.dvc-hit'); if(el) show(el); else tip.hidden=true; };
+  box.onmouseover=on; box.onclick=on; box.onmouseleave=()=>{ tip.hidden=true; };
+}
+
 function dvCSV(){
   const rows=dvSortedRows(dvFilter());
   const head=['매매일','구역','단지','평','동','층','매매가(억)','직전대비(억)','공시가','공시가배수','대지지분','지분평당가','거래유형'];
